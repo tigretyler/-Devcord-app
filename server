@@ -1,0 +1,477 @@
+import socket
+import threading
+import json
+import time
+import os
+import hashlib
+import base64
+from datetime import datetime
+import mimetypes
+import logging
+from collections import deque
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("discord_server.log"),
+        logging.StreamHandler()
+    ]
+)
+
+class DiscordServer:
+    def __init__(self, host='0.0.0.0', port=6237):
+        self.host = host
+        self.port = port
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind((self.host, self.port))
+        self.server.listen(10)
+        
+        # Estructura de datos
+        self.channels = {
+            "general": {
+                "messages": deque(maxlen=100),
+                "users": set()
+            },
+            "random": {
+                "messages": deque(maxlen=100),
+                "users": set()
+            }
+        }
+        self.users = {}  # {socket: {"username": "", "current_channel": ""}}
+        self.user_activity = {}
+        self.file_storage = "server_files"
+        self.file_index = {}
+        self.running = True
+        
+        os.makedirs(self.file_storage, exist_ok=True)
+        self.load_existing_files()
+        
+        logging.info(f"🚀 Servidor Discord iniciado en {self.host}:{self.port}")
+
+    def load_existing_files(self):
+        for filename in os.listdir(self.file_storage):
+            filepath = os.path.join(self.file_storage, filename)
+            if os.path.isfile(filepath):
+                file_id = hashlib.md5(filename.encode()).hexdigest()[:8]
+                self.file_index[file_id] = {
+                    'filename': filename,
+                    'path': filepath,
+                    'size': os.path.getsize(filepath),
+                    'mimetype': mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+                }
+
+    def start(self):
+        accept_thread = threading.Thread(target=self.accept_connections, daemon=True)
+        accept_thread.start()
+        
+        monitor_thread = threading.Thread(target=self.system_monitor, daemon=True)
+        monitor_thread.start()
+        
+        try:
+            while self.running:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            self.shutdown()
+
+    def system_monitor(self):
+        while self.running:
+            with threading.Lock():
+                current_time = time.time()
+                for client_socket, last_active in list(self.user_activity.items()):
+                    if current_time - last_active > 180:  # 3 minutos de inactividad
+                        if client_socket in self.users:
+                            username = self.users[client_socket]["username"]
+                            logging.warning(f"Desconectando usuario inactivo: {username}")
+                            self.disconnect_user(client_socket)
+                
+                # Log de estado
+                user_count = len(self.users)
+                msg_count = sum(len(channel["messages"]) for channel in self.channels.values())
+                logging.info(f"📊 Estado: {user_count} usuarios | {msg_count} mensajes | {len(self.file_index)} archivos")
+            
+            time.sleep(30)
+
+    def accept_connections(self):
+        while self.running:
+            try:
+                client_socket, addr = self.server.accept()
+                client_socket.settimeout(5.0)
+                logging.info(f"🔌 Nueva conexión: {addr[0]}:{addr[1]}")
+                
+                # Iniciar hilo para manejar cliente
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket,),
+                    daemon=True
+                )
+                client_thread.start()
+                
+            except Exception as e:
+                logging.error(f"⚠️ Error aceptando conexión: {e}")
+
+    def handle_client(self, client_socket):
+        try:
+            while self.running:
+                try:
+                    message = client_socket.recv(65536)  # Mayor tamaño para archivos
+                    if not message:
+                        break
+                    
+                    # Actualizar actividad
+                    self.user_activity[client_socket] = time.time()
+                    
+                    try:
+                        msg_data = json.loads(message.decode('utf-8'))
+                        self.process_client_message(client_socket, msg_data)
+                    except json.JSONDecodeError:
+                        logging.warning("⚠️ Mensaje no válido recibido")
+                    
+                except socket.timeout:
+                    # Enviar ping para verificar conexión
+                    try:
+                        client_socket.send(json.dumps({'type': 'ping'}).encode('utf-8'))
+                    except:
+                        break
+                except ConnectionResetError:
+                    break
+                    
+        except Exception as e:
+            logging.error(f"⚠️ Error manejando cliente: {e}")
+        finally:
+            self.disconnect_user(client_socket)
+
+    def process_client_message(self, client_socket, msg_data):
+        msg_type = msg_data.get('type')
+        
+        if msg_type == 'register':
+            self.register_user(client_socket, msg_data)
+        elif msg_type == 'message':
+            self.process_message(client_socket, msg_data)
+        elif msg_type == 'file':
+            self.process_file(client_socket, msg_data)
+        elif msg_type == 'join_channel':
+            self.join_channel(client_socket, msg_data)
+        elif msg_type == 'leave_channel':
+            self.leave_channel(client_socket, msg_data)
+        elif msg_type == 'file_request':
+            self.handle_file_request(client_socket, msg_data)
+        elif msg_type == 'ping':
+            client_socket.send(json.dumps({'type': 'pong'}).encode('utf-8'))
+
+    def register_user(self, client_socket, msg_data):
+        username = msg_data.get('username', '').strip()[:20]
+        if not username:
+            error_msg = {'type': 'error', 'message': "Nombre de usuario inválido"}
+            client_socket.send(json.dumps(error_msg).encode('utf-8'))
+            return
+            
+        # Asignar usuario
+        self.users[client_socket] = {
+            "username": username,
+            "current_channel": "general"
+        }
+        self.user_activity[client_socket] = time.time()
+        
+        # Unir al canal general por defecto
+        self.channels["general"]["users"].add(client_socket)
+        
+        # Enviar datos iniciales
+        initial_data = {
+            'type': 'server_info',
+            'channels': list(self.channels.keys()),
+            'current_channel': 'general',
+            'channel_history': list(self.channels["general"]["messages"])
+        }
+        client_socket.send(json.dumps(initial_data).encode('utf-8'))
+        
+        # Notificar a otros usuarios
+        join_msg = {
+            'type': 'user_joined',
+            'user': username,
+            'channel': 'general',
+            'timestamp': datetime.now().isoformat()
+        }
+        self.broadcast_to_channel('general', join_msg, exclude=client_socket)
+        
+        logging.info(f"👤 Nuevo usuario registrado: {username}")
+
+    def process_message(self, client_socket, msg_data):
+        if client_socket not in self.users:
+            return
+            
+        user_data = self.users[client_socket]
+        channel = user_data["current_channel"]
+        message = msg_data.get('message', '').strip()
+        
+        if not message:
+            return
+            
+        # Crear mensaje estructurado
+        full_msg = {
+            'type': 'message',
+            'user': user_data["username"],
+            'message': message,
+            'channel': channel,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Guardar en historial del canal
+        self.channels[channel]["messages"].append(full_msg)
+        
+        # Transmitir a todos en el canal
+        self.broadcast_to_channel(channel, full_msg)
+        
+        logging.info(f"💬 Mensaje en #{channel} de {user_data['username']}: {message}")
+
+    def process_file(self, client_socket, msg_data):
+        if client_socket not in self.users:
+            return
+            
+        user_data = self.users[client_socket]
+        channel = user_data["current_channel"]
+        file_name = msg_data.get('file_name', '')
+        file_content = msg_data.get('content', '')
+        
+        if not file_name or not file_content:
+            return
+            
+        # Generar ID único para el archivo
+        file_id = hashlib.md5(f"{file_name}{time.time()}".encode()).hexdigest()[:8]
+        safe_filename = f"{file_id}_{file_name.replace('/', '_')}"
+        file_path = os.path.join(self.file_storage, safe_filename)
+        
+        try:
+            # Decodificar contenido base64
+            file_bytes = base64.b64decode(file_content.encode('latin1'))
+            
+            # Guardar archivo
+            with open(file_path, 'wb') as f:
+                f.write(file_bytes)
+            
+            # Registrar en índice
+            self.file_index[file_id] = {
+                'filename': file_name,
+                'path': file_path,
+                'size': len(file_bytes),
+                'mimetype': mimetypes.guess_type(file_name)[0] or 'application/octet-stream'
+            }
+            
+            # Crear mensaje de notificación
+            file_msg = {
+                'type': 'file',
+                'file_id': file_id,
+                'file_name': file_name,
+                'user': user_data["username"],
+                'channel': channel,
+                'timestamp': datetime.now().isoformat(),
+                'size': len(file_bytes)
+            }
+            
+            # Guardar en historial y transmitir
+            self.channels[channel]["messages"].append(file_msg)
+            self.broadcast_to_channel(channel, file_msg)
+            
+            logging.info(f"📁 Archivo subido en #{channel} por {user_data['username']}: {file_name}")
+            
+        except Exception as e:
+            logging.error(f"Error procesando archivo: {e}")
+            error_msg = {
+                'type': 'error',
+                'message': f"No se pudo subir el archivo: {str(e)}"
+            }
+            client_socket.send(json.dumps(error_msg).encode('utf-8'))
+
+    def join_channel(self, client_socket, msg_data):
+        if client_socket not in self.users:
+            return
+            
+        user_data = self.users[client_socket]
+        new_channel = msg_data.get('channel', '')
+        
+        if new_channel not in self.channels:
+            # Crear nuevo canal si no existe
+            self.channels[new_channel] = {
+                "messages": deque(maxlen=100),
+                "users": set()
+            }
+        
+        old_channel = user_data["current_channel"]
+        
+        # Salir del canal anterior
+        if old_channel in self.channels:
+            self.channels[old_channel]["users"].discard(client_socket)
+            
+            # Notificar salida
+            leave_msg = {
+                'type': 'user_left',
+                'user': user_data["username"],
+                'channel': old_channel,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.broadcast_to_channel(old_channel, leave_msg)
+        
+        # Unirse al nuevo canal
+        self.channels[new_channel]["users"].add(client_socket)
+        user_data["current_channel"] = new_channel
+        
+        # Enviar historial del canal al usuario
+        channel_data = {
+            'type': 'channel_info',
+            'channel': new_channel,
+            'users': [self.users[sock]["username"] for sock in self.channels[new_channel]["users"]],
+            'history': list(self.channels[new_channel]["messages"])
+        }
+        client_socket.send(json.dumps(channel_data).encode('utf-8'))
+        
+        # Notificar unión al nuevo canal
+        join_msg = {
+            'type': 'user_joined',
+            'user': user_data["username"],
+            'channel': new_channel,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.broadcast_to_channel(new_channel, join_msg, exclude=client_socket)
+        
+        logging.info(f"🔁 {user_data['username']} se unió a #{new_channel}")
+
+    def leave_channel(self, client_socket, msg_data):
+        if client_socket not in self.users:
+            return
+            
+        user_data = self.users[client_socket]
+        channel = msg_data.get('channel', '')
+        
+        if channel not in self.channels:
+            return
+            
+        # Salir del canal
+        self.channels[channel]["users"].discard(client_socket)
+        
+        # Notificar salida
+        leave_msg = {
+            'type': 'user_left',
+            'user': user_data["username"],
+            'channel': channel,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.broadcast_to_channel(channel, leave_msg)
+        
+        logging.info(f"👋 {user_data['username']} dejó #{channel}")
+
+    def handle_file_request(self, client_socket, msg_data):
+        file_id = msg_data.get('file_id')
+        transfer_id = msg_data.get('transfer_id')
+        
+        if not file_id or file_id not in self.file_index:
+            error_msg = {
+                'type': 'error',
+                'message': "Archivo no encontrado"
+            }
+            client_socket.send(json.dumps(error_msg).encode('utf-8'))
+            return
+            
+        file_info = self.file_index[file_id]
+        
+        try:
+            with open(file_info['path'], 'rb') as f:
+                file_bytes = f.read()
+            
+            # Codificar en base64 para transferencia
+            encoded_content = base64.b64encode(file_bytes).decode('latin1')
+            
+            file_data = {
+                'type': 'file_transfer',
+                'file_id': file_id,
+                'file_name': file_info['filename'],
+                'content': encoded_content,
+                'mimetype': file_info['mimetype'],
+                'size': file_info['size'],
+                'transfer_id': transfer_id
+            }
+            
+            client_socket.send(json.dumps(file_data).encode('utf-8'))
+            logging.info(f"📤 Enviando archivo: {file_info['filename']}")
+            
+        except Exception as e:
+            logging.error(f"Error enviando archivo: {e}")
+            error_msg = {
+                'type': 'error',
+                'message': f"No se pudo enviar el archivo: {str(e)}"
+            }
+            client_socket.send(json.dumps(error_msg).encode('utf-8'))
+
+    def broadcast_to_channel(self, channel, message, exclude=None):
+        """Envía mensaje a todos los usuarios en un canal"""
+        if channel not in self.channels:
+            return
+            
+        msg_json = json.dumps(message)
+        for client_sock in list(self.channels[channel]["users"]):
+            if exclude and client_sock == exclude:
+                continue
+                
+            try:
+                client_sock.send(msg_json.encode('utf-8'))
+            except:
+                self.disconnect_user(client_sock)
+
+    def disconnect_user(self, client_socket):
+        if client_socket in self.users:
+            user_data = self.users[client_socket]
+            username = user_data["username"]
+            channel = user_data["current_channel"]
+            
+            # Salir de todos los canales
+            for chan in self.channels.values():
+                if client_socket in chan["users"]:
+                    chan["users"].discard(client_socket)
+            
+            # Notificar desconexión
+            if channel in self.channels:
+                disconnect_msg = {
+                    'type': 'user_disconnected',
+                    'user': username,
+                    'channel': channel,
+                    'timestamp': datetime.now().isoformat()
+                }
+                self.broadcast_to_channel(channel, disconnect_msg)
+            
+            # Limpiar registros
+            del self.users[client_socket]
+            if client_socket in self.user_activity:
+                del self.user_activity[client_socket]
+            
+            try:
+                client_socket.close()
+            except:
+                pass
+            
+            logging.info(f"🔌 {username} desconectado")
+
+    def shutdown(self):
+        logging.info("🛑 Apagando servidor Discord...")
+        self.running = False
+        
+        # Notificar a los clientes
+        shutdown_msg = {
+            'type': 'server_shutdown',
+            'message': "El servidor se está apagando",
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        for client_socket in list(self.users.keys()):
+            try:
+                client_socket.send(json.dumps(shutdown_msg).encode('utf-8'))
+                client_socket.close()
+            except:
+                pass
+                    
+        self.server.close()
+        logging.info("✅ Servidor Discord detenido")
+
+if __name__ == "__main__":
+    server = DiscordServer()
+    server.start()
